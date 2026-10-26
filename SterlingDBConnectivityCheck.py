@@ -18,6 +18,7 @@ OUTPUT_CSV    = os.path.join(SCRIPT_DIR, "SterlingReleaseExtract.csv")
 QUERY_TIMEOUT = 900
 
 # Sterling reporting DB: the JDBC thin URL without the "jdbc:oracle:thin:@" prefix.
+# .23 is tried first (the host given for YOUR_DB_SERVICE); .22 is the fallback.
 STERLING_DSN = ("(DESCRIPTION =(ADDRESS_LIST =(FAILOVER = ON)(LOAD_BALANCE = OFF)"
                 "(ADDRESS = (PROTOCOL = TCP)(HOST = YOUR_DB_HOST)(PORT = 1521))"
                 "(ADDRESS = (PROTOCOL = TCP)(HOST = YOUR_DB_HOST)(PORT = 1521)))"
