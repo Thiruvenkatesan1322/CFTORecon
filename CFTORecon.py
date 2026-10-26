@@ -1,16 +1,23 @@
 """Compare a supplied WCS CSV or WMS workbook with yesterday's Sterling releases.
 
 Configure the variables below, then run this standalone script.
-Requires paramiko locally, SQLPlus on the jump server, and openpyxl for Excel only.
+Requires paramiko and oracledb locally, and openpyxl for Excel only.
+SQLPlus is not required. The jump server must allow SSH TCP forwarding.
 """
 
+import argparse
+from contextlib import contextmanager
 import csv
 from datetime import datetime
 from html import escape
 from itertools import islice
 from pathlib import Path
 import re
+import select
+import socket
+import socketserver
 import sys
+import threading
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -23,6 +30,7 @@ JUMP_PORT = 22
 JUMP_USER = "YOUR_JUMP_USER"
 KEY_PATH = r"PATH_TO_SSH_PRIVATE_KEY"
 KNOWN_HOSTS = SCRIPT_DIR / "known_hosts"
+SSH_CONNECT_TIMEOUT = 20
 QUERY_TIMEOUT = 900
 
 STERLING_DSN = ("(DESCRIPTION =(ADDRESS = (PROTOCOL = TCP)(HOST = YOUR_DB_HOST)(PORT = 1521))"
@@ -38,27 +46,63 @@ WMS_HEADER_ROW = 1
 WMS_ORDER_COLUMN = "ORDER_NUMBER"
 OUTPUT_HTML = SCRIPT_DIR / "CFTOReconReport.html"
 
-SQLPLUS_SCRIPT = """WHENEVER OSERROR EXIT FAILURE
-WHENEVER SQLERROR EXIT FAILURE
-SET DEFINE OFF ECHO OFF
-SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMOUT ON TAB OFF LINESIZE 32767
-CONNECT {user}/"{password}"@{dsn}
-PROMPT __ROWS_START__
-{query};
-PROMPT __ROWS_END__
-EXIT
-"""
+def open_jump_socket():
+    try:
+        return socket.create_connection((JUMP_HOST, JUMP_PORT), timeout=SSH_CONNECT_TIMEOUT)
+    except socket.gaierror as error:
+        raise RuntimeError("Cannot resolve SSH jump host '{}'. Check corporate VPN and DNS.".format(
+            JUMP_HOST)) from error
+    except socket.timeout as error:
+        raise RuntimeError("SSH TCP connection to {}:{} timed out after {} seconds. "
+                           "Check corporate VPN, firewall access and the SSH port; "
+                           "the Oracle database has not been contacted.".format(
+                               JUMP_HOST, JUMP_PORT, SSH_CONNECT_TIMEOUT)) from error
+    except OSError as error:
+        raise RuntimeError("Cannot open SSH TCP connection to {}:{}: {}. "
+                           "Confirm the jump host, SSH port and network access.".format(
+                               JUMP_HOST, JUMP_PORT, error)) from error
 
 
-def run_ssh_command(client, command, stdin_text=None, timeout=30):
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    if stdin_text is not None:
-        stdin.write(stdin_text)
-        stdin.flush()
-        stdin.channel.shutdown_write()
-    output = stdout.read().decode(errors="replace")
-    error_output = stderr.read().decode(errors="replace")
-    return stdout.channel.recv_exit_status(), output, error_output
+@contextmanager
+def open_sterling_tunnel(transport, database_host, database_port):
+    stopped = threading.Event()
+    forwarding_errors = []
+
+    class ForwardHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            try:
+                self.request.settimeout(SSH_CONNECT_TIMEOUT)
+                with transport.open_channel(
+                    "direct-tcpip", (database_host, database_port), self.client_address,
+                    timeout=SSH_CONNECT_TIMEOUT,
+                ) as channel:
+                    channel.settimeout(SSH_CONNECT_TIMEOUT)
+                    while not stopped.is_set():
+                        readable, _, _ = select.select([self.request, channel], [], [], 0.2)
+                        if self.request in readable:
+                            data = self.request.recv(65536)
+                            if not data:
+                                break
+                            channel.sendall(data)
+                        if channel in readable:
+                            data = channel.recv(65536)
+                            if not data:
+                                break
+                            self.request.sendall(data)
+            except Exception as error:
+                if not stopped.is_set():
+                    forwarding_errors.append(error)
+
+    with socketserver.ThreadingTCPServer(("127.0.0.1", 0), ForwardHandler) as server:
+        worker = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": 0.1}, daemon=True)
+        worker.start()
+        try:
+            yield server.server_address[1], forwarding_errors
+        finally:
+            stopped.set()
+            server.shutdown()
+            worker.join()
 
 
 def normalise_id(value, number_format=""):
@@ -148,56 +192,83 @@ def read_wms_orders(path, sheet_name, header_row, order_column):
         workbook.close()
 
 
-def parse_sterling_output(status, output, error_output):
-    errors = sorted(set(re.findall(r"\b(?:ORA|SP2|TNS)-\d+\b", output + "\n" + error_output)))
-    lines = [line.strip() for line in output.splitlines()]
-    if status != 0 or errors:
-        raise RuntimeError("Sterling query failed (exit {}; {}).".format(
-            status, ", ".join(errors) if errors else "no Oracle error code returned"))
-    if lines.count("__ROWS_START__") != 1 or lines.count("__ROWS_END__") != 1:
-        raise RuntimeError("Sterling query did not return a complete result.")
-    start = lines.index("__ROWS_START__")
-    end = lines.index("__ROWS_END__")
-    if end <= start:
-        raise RuntimeError("Sterling result markers are out of order.")
-    return [line for line in lines[start + 1:end] if line]
-
-
 def fetch_sterling_orders():
     if not STERLING_DB_USER.strip() or not STERLING_DB_PASSWORD:
         raise ValueError("Set STERLING_DB_USER and STERLING_DB_PASSWORD in CFTORecon.py before running.")
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_$#]*", STERLING_DB_USER):
-        raise ValueError("Use an unquoted Oracle username for STERLING_DB_USER.")
-    if any(character in STERLING_DB_PASSWORD for character in '\r\n"'):
-        raise ValueError("The SQLPlus password cannot contain a newline or double quote.")
+    if not Path(KEY_PATH).is_file():
+        raise ValueError("SSH private key not found: {}. Set KEY_PATH for this computer.".format(
+            KEY_PATH))
 
+    import oracledb
     import paramiko
 
-    script = SQLPLUS_SCRIPT.format(
-        user=STERLING_DB_USER,
-        password=STERLING_DB_PASSWORD,
-        dsn=re.sub(r"\s+", "", STERLING_DSN),
-        query=STERLING_RELEASE_QUERY.rstrip().rstrip(";"),
-    )
+    database_params = oracledb.ConnectParams()
+    database_params.parse_connect_string(STERLING_DSN)
+    if not isinstance(database_params.host, str) or not isinstance(database_params.port, int):
+        raise ValueError("STERLING_DSN must identify one database host and port.")
+    if database_params.protocol != "tcp":
+        raise ValueError("This SSH tunnel requires a TCP database connection.")
+    if not database_params.service_name and not database_params.sid:
+        raise ValueError("STERLING_DSN must include a database service name or SID.")
+
     client = paramiko.SSHClient()
+    connection_socket = None
     try:
+        connection_socket = open_jump_socket()
         client.load_system_host_keys()
         Path(KNOWN_HOSTS).touch(exist_ok=True)
         client.load_host_keys(str(KNOWN_HOSTS))
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=JUMP_HOST, port=JUMP_PORT, username=JUMP_USER,
-                       key_filename=KEY_PATH, look_for_keys=False, allow_agent=False,
-                       timeout=20, auth_timeout=20, banner_timeout=20)
-        status, output, error_output = run_ssh_command(
-            client, "bash -lc 'command -v sqlplus'", timeout=30)
-        if status != 0:
-            raise RuntimeError("SQLPlus is not available on the jump server.")
-        status, output, error_output = run_ssh_command(
-            client, "bash -lc 'sqlplus -L -s /nolog'", stdin_text=script,
-            timeout=QUERY_TIMEOUT)
-        return parse_sterling_output(status, output, error_output)
+        try:
+            client.connect(hostname=JUMP_HOST, port=JUMP_PORT, username=JUMP_USER,
+                           key_filename=KEY_PATH, look_for_keys=False, allow_agent=False,
+                           sock=connection_socket, timeout=SSH_CONNECT_TIMEOUT,
+                           auth_timeout=20, banner_timeout=20)
+        except paramiko.AuthenticationException as error:
+            raise RuntimeError("SSH authentication failed. Check JUMP_USER and KEY_PATH; "
+                               "the Oracle database has not been contacted.") from error
+        except socket.timeout as error:
+            raise RuntimeError("SSH handshake or authentication timed out. TCP connected, "
+                               "but the jump server did not complete SSH login.") from error
+        except paramiko.SSHException as error:
+            raise RuntimeError("SSH login failed: {}".format(error)) from error
+
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            raise RuntimeError("The SSH connection closed before database forwarding started.")
+        transport.set_keepalive(30)
+
+        with open_sterling_tunnel(transport, database_params.host, database_params.port) as tunnel:
+            local_port, forwarding_errors = tunnel
+            try:
+                with oracledb.connect(
+                    user=STERLING_DB_USER, password=STERLING_DB_PASSWORD,
+                    host="127.0.0.1", port=local_port,
+                    service_name=database_params.service_name, sid=database_params.sid,
+                    tcp_connect_timeout=SSH_CONNECT_TIMEOUT, retry_count=0, disable_oob=True,
+                ) as connection:
+                    connection.call_timeout = QUERY_TIMEOUT * 1000
+                    with connection.cursor() as cursor:
+                        cursor.execute(STERLING_RELEASE_QUERY.rstrip().rstrip(";"))
+                        orders = []
+                        for row in cursor:
+                            identifier = normalise_id(row[0])
+                            if identifier:
+                                orders.append(identifier)
+                        return orders
+            except oracledb.Error as error:
+                if forwarding_errors:
+                    raise RuntimeError("Cannot forward the SSH tunnel to {}:{}: {}. "
+                                       "Ask the Unix team to check TCP forwarding permission "
+                                       "and database network access from the jump server.".format(
+                                           database_params.host, database_params.port,
+                                           forwarding_errors[0])) from error
+                raise RuntimeError("Sterling database connection or query failed: {}".format(
+                    error)) from error
     finally:
         client.close()
+        if connection_socket is not None:
+            connection_socket.close()
 
 
 def compare_orders(wms_orders, sterling_orders):
@@ -279,8 +350,19 @@ th {{ background: var(--band); }}
     )
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-ssh", action="store_true",
+                        help="Test jump-host TCP connectivity without credentials or a database query.")
+    arguments = parser.parse_args(argv)
     try:
+        if arguments.check_ssh:
+            connection_socket = open_jump_socket()
+            connection_socket.close()
+            print("PASS: TCP connection to {}:{} succeeded. "
+                  "SSH authentication and the Oracle database were not checked.".format(
+                      JUMP_HOST, JUMP_PORT))
+            return 0
         wms_orders, sheet_name = read_wms_orders(
             WMS_EXCEL_PATH, WMS_SHEET_NAME, WMS_HEADER_ROW, WMS_ORDER_COLUMN)
         sterling_orders = fetch_sterling_orders()
