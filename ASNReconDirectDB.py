@@ -16,10 +16,10 @@ ASSIGNEE_TEAM       = "Sterling Support"
 
 WMS_DB = {
     "name": "WMS",
-    "host": "YOUR_DB_HOST",
+    "host": "YOUR_WMS_DB_HOST",
     "port": 1521,
-    "service": "YOUR_DB_SERVICE",
-    "user": "YOUR_DB_USER",
+    "service": "YOUR_WMS_DB_SERVICE",
+    "user": "YOUR_WMS_DB_USER",
     "password_env": "ASN_WMS_DB_PASSWORD",
 }
 
@@ -33,7 +33,7 @@ STERLING_DB = {
     "password_env": "ASN_STERLING_DB_PASSWORD",
 }
 
-BASE_DIR               = r"PATH_TO_RECON_OUTPUT"
+BASE_DIR               = "PATH_TO_RECON_OUTPUT"
 ATTACHMENT_DIR         = os.path.join(BASE_DIR, "AttachmentFolder")
 LOG_PATH               = os.path.join(BASE_DIR, "Process Logs.log")
 WMS_EXTRACT            = os.path.join(BASE_DIR, "WMSExtract.csv")

@@ -7,10 +7,10 @@ import time
 
 import paramiko
 
-# Path: this host -> SSH -> YOUR_JUMP_HOST -> port 1521 -> Sterling DB. The query runs in sqlplus on the jump host.
+# Path: this host -> SSH jump server -> port 1521 -> Sterling DB. The query runs in sqlplus on the jump host.
 JUMP_HOST = "YOUR_JUMP_HOST"
 JUMP_USER = "YOUR_JUMP_USER"
-KEY_PATH  = r"PATH_TO_SSH_PRIVATE_KEY"
+KEY_PATH  = "PATH_TO_SSH_PRIVATE_KEY"
 
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 KNOWN_HOSTS   = os.path.join(SCRIPT_DIR, "known_hosts")
@@ -18,7 +18,6 @@ OUTPUT_CSV    = os.path.join(SCRIPT_DIR, "SterlingReleaseExtract.csv")
 QUERY_TIMEOUT = 900
 
 # Sterling reporting DB: the JDBC thin URL without the "jdbc:oracle:thin:@" prefix.
-# Only YOUR_DB_HOST for now; replace with the failover descriptor once it is shared.
 STERLING_DSN = ("(DESCRIPTION =(ADDRESS = (PROTOCOL = TCP)(HOST = YOUR_DB_HOST)(PORT = 1521))"
                 "(CONNECT_DATA =(SERVICE_NAME = YOUR_DB_SERVICE)))")
 
